@@ -1,0 +1,10 @@
+{
+  "name": "salon-reminders",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Salje FCM podsetnike i obavestenja o otkazivanju za SalonBooking aplikaciju",
+  "main": "send_reminders.js",
+  "dependencies": {
+    "firebase-admin": "^12.1.0"
+  }
+}
