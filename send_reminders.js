@@ -4,11 +4,13 @@
 // Koristi Firebase Admin SDK da:
 //   1) pošalje push podsetnik korisnicima čiji termin počinje za
 //      X sati (podešeno u settings/salon -> notificationHoursBefore),
-//   2) pošalje push obaveštenje korisnicima čiji je termin otkazao ADMIN,
-//   3) pošalje push obaveštenje ADMINU kad neko zakaže NOV termin.
+//   2) pošalje push obaveštenje korisniku ako je ADMIN otkazao termin,
+//   3) pošalje push obaveštenje ADMINU kad neko zakaže NOV termin,
+//   4) pošalje push obaveštenje ADMINU kad KORISNIK otkaže termin.
 //
 // Ne šalje ništa dvaput (proverava notificationSent / adminCancelNotified /
-// adminNotified polja pre slanja i postavlja ih na true posle uspešnog slanja).
+// adminNotified / userCancelAdminNotified polja pre slanja i postavlja ih
+// na true posle uspešnog slanja).
 
 const admin = require("firebase-admin");
 
@@ -103,30 +105,11 @@ async function sendAdminCancellationNotifications() {
   }
 }
 
-/**
- * Salje obavestenje SVIM admin nalozima (sa admin_whitelist) kad neko zakaze
- * nov termin. Admin broj telefona -> pronalazi se korisnicki nalog sa tim
- * brojem -> uzima se njegov fcmToken (ako postoji, tj. ako se admin bar
- * jednom ulogovao u aplikaciju na svom telefonu).
- */
-async function notifyAdminsOfNewBookings() {
-  const snapshot = await db
-    .collection("appointments")
-    .where("status", "==", "ZAKAZAN")
-    .where("adminNotified", "==", false)
-    .get();
-
-  console.log(`[admin-obavestenje] Pronadjeno ${snapshot.size} novih termina za prijavu adminu.`);
-
-  if (snapshot.empty) return;
-
+/** Pronalazi FCM tokene svih naloga sa admin whitelist-e (pomocna funkcija,
+ * koristi je i notifyAdminsOfNewBookings i notifyAdminOfUserCancellations). */
+async function getAdminTokens() {
   const whitelistSnap = await db.collection("admin_whitelist").get();
   const adminPhones = whitelistSnap.docs.map((d) => d.id);
-
-  if (adminPhones.length === 0) {
-    console.log("[admin-obavestenje] Nema admin brojeva na whitelisti.");
-    return;
-  }
 
   const adminTokens = [];
   for (const phone of adminPhones) {
@@ -136,9 +119,25 @@ async function notifyAdminsOfNewBookings() {
       if (token) adminTokens.push(token);
     });
   }
+  return adminTokens;
+}
 
+/**
+ * Salje obavestenje SVIM admin nalozima kad neko zakaze nov termin.
+ */
+async function notifyAdminsOfNewBookings() {
+  const snapshot = await db
+    .collection("appointments")
+    .where("status", "==", "ZAKAZAN")
+    .where("adminNotified", "==", false)
+    .get();
+
+  console.log(`[admin-nov-termin] Pronadjeno ${snapshot.size} novih termina za prijavu adminu.`);
+  if (snapshot.empty) return;
+
+  const adminTokens = await getAdminTokens();
   if (adminTokens.length === 0) {
-    console.log("[admin-obavestenje] Nijedan admin nema fcmToken (nije se ulogovao na telefonu).");
+    console.log("[admin-nov-termin] Nijedan admin nema fcmToken ili whitelist je prazna.");
   }
 
   for (const doc of snapshot.docs) {
@@ -154,12 +153,56 @@ async function notifyAdminsOfNewBookings() {
           },
         });
       } catch (err) {
-        console.error(`[admin-obavestenje] Greska slanja adminu za termin ${doc.id}:`, err.message);
+        console.error(`[admin-nov-termin] Greska slanja adminu za termin ${doc.id}:`, err.message);
       }
     }
 
     await doc.ref.update({ adminNotified: true });
-    console.log(`[admin-obavestenje] Admin obavesten za termin ${doc.id}`);
+    console.log(`[admin-nov-termin] Admin obavesten za termin ${doc.id}`);
+  }
+}
+
+/**
+ * NOVO: Salje obavestenje SVIM admin nalozima kad KORISNIK (ne admin) otkaze
+ * svoj termin. Automatsko oslobadjanje termina se vec desava odmah u trenutku
+ * otkazivanja (u samoj aplikaciji, kroz Firestore transakciju) - ovo je samo
+ * dodatno obavestenje adminu da je do otkazivanja doslo.
+ */
+async function notifyAdminOfUserCancellations() {
+  const snapshot = await db
+    .collection("appointments")
+    .where("status", "==", "OTKAZAN")
+    .where("cancelledBy", "==", "USER")
+    .where("userCancelAdminNotified", "==", false)
+    .get();
+
+  console.log(`[admin-otkazivanje] Pronadjeno ${snapshot.size} termina koje je korisnik otkazao.`);
+  if (snapshot.empty) return;
+
+  const adminTokens = await getAdminTokens();
+  if (adminTokens.length === 0) {
+    console.log("[admin-otkazivanje] Nijedan admin nema fcmToken ili whitelist je prazna.");
+  }
+
+  for (const doc of snapshot.docs) {
+    const appointment = doc.data();
+
+    for (const token of adminTokens) {
+      try {
+        await admin.messaging().send({
+          token,
+          notification: {
+            title: "Korisnik je otkazao termin",
+            body: `${appointment.userName} je otkazao/la: ${appointment.serviceName}, ${appointment.date} u ${appointment.startTime}. Termin je sada slobodan.`,
+          },
+        });
+      } catch (err) {
+        console.error(`[admin-otkazivanje] Greska slanja adminu za termin ${doc.id}:`, err.message);
+      }
+    }
+
+    await doc.ref.update({ userCancelAdminNotified: true });
+    console.log(`[admin-otkazivanje] Admin obavesten za termin ${doc.id}`);
   }
 }
 
@@ -168,6 +211,7 @@ async function notifyAdminsOfNewBookings() {
     await sendReminders();
     await sendAdminCancellationNotifications();
     await notifyAdminsOfNewBookings();
+    await notifyAdminOfUserCancellations();
     console.log("Gotovo.");
     process.exit(0);
   } catch (err) {
