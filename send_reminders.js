@@ -1,9 +1,21 @@
 // send_reminders.js
 //
-// Pokreće se periodično (svakih 15 minuta) preko GitHub Actions.
+// Pokreće se periodično (svakih 15 minuta, prema rasporedu) preko
+// GitHub Actions. VAŽNA NAPOMENA: GitHub Actions cron raspored NIJE
+// garantovano tačan na minut — često kasni 10-40 minuta u periodima
+// velike zauzetosti servera (ovo je poznato ograničenje besplatnih
+// GitHub Actions runner-a, ne greška u ovom kodu). Zbog toga logika
+// ispod NE koristi uzak "prozor" (npr. tačno između +2h00m i +2h20m),
+// već umesto toga šalje podsetnik čim EFEKTIVNO vreme za podsetnik
+// nastupi (>= sada), bez gornje granice — garantujući da se podsetnik
+// NIKAD trajno ne izgubi, čak i ako GitHub Actions kasni. Cena ove
+// pouzdanosti je što podsetnik može stići par minuta kasnije od
+// idealnog trenutka (npr. 1:50h pre termina umesto tačno 2:00h), ali
+// NIKAD pre vremena i NIKAD potpuno izostane.
+//
 // Koristi Firebase Admin SDK da:
-//   1) pošalje push podsetnik korisnicima čiji termin počinje za
-//      X sati (podešeno u settings/salon -> notificationHoursBefore),
+//   1) pošalje push podsetnik korisnicima čiji termin počinje uskoro
+//      (podešeno u settings/salon -> notificationHoursBefore),
 //   2) pošalje push obaveštenje korisniku ako je ADMIN otkazao termin,
 //   3) pošalje push obaveštenje ADMINU kad neko zakaže NOV termin,
 //   4) pošalje push obaveštenje ADMINU kad KORISNIK otkaže termin.
@@ -28,17 +40,20 @@ async function sendReminders() {
     (settingsDoc.exists && settingsDoc.data().notificationHoursBefore) || 2;
 
   const now = Date.now();
-  const windowStart = now + hoursBefore * 60 * 60 * 1000;
-  const windowEnd = windowStart + 20 * 60 * 1000;
+  // Termin treba da počne najkasnije za "hoursBefore" sati RAČUNAJUĆI OD SADA
+  // (tj. vreme podsetnika je već nastupilo ili nastupa uskoro), ali termin
+  // još uvek nije počeo (timestamp > now) - inače bismo podsećali na već
+  // prošle termine.
+  const reminderThreshold = now + hoursBefore * 60 * 60 * 1000;
 
   const snapshot = await db
     .collection("appointments")
     .where("status", "==", "ZAKAZAN")
-    .where("timestamp", ">=", windowStart)
-    .where("timestamp", "<", windowEnd)
+    .where("timestamp", ">", now)
+    .where("timestamp", "<=", reminderThreshold)
     .get();
 
-  console.log(`[podsetnici] Pronadjeno ${snapshot.size} termina u prozoru.`);
+  console.log(`[podsetnici] Pronadjeno ${snapshot.size} termina za podsetnik (kandidati).`);
 
   for (const doc of snapshot.docs) {
     const appointment = doc.data();
@@ -105,8 +120,6 @@ async function sendAdminCancellationNotifications() {
   }
 }
 
-/** Pronalazi FCM tokene svih naloga sa admin whitelist-e (pomocna funkcija,
- * koristi je i notifyAdminsOfNewBookings i notifyAdminOfUserCancellations). */
 async function getAdminTokens() {
   const whitelistSnap = await db.collection("admin_whitelist").get();
   const adminPhones = whitelistSnap.docs.map((d) => d.id);
@@ -122,9 +135,6 @@ async function getAdminTokens() {
   return adminTokens;
 }
 
-/**
- * Salje obavestenje SVIM admin nalozima kad neko zakaze nov termin.
- */
 async function notifyAdminsOfNewBookings() {
   const snapshot = await db
     .collection("appointments")
@@ -162,12 +172,6 @@ async function notifyAdminsOfNewBookings() {
   }
 }
 
-/**
- * NOVO: Salje obavestenje SVIM admin nalozima kad KORISNIK (ne admin) otkaze
- * svoj termin. Automatsko oslobadjanje termina se vec desava odmah u trenutku
- * otkazivanja (u samoj aplikaciji, kroz Firestore transakciju) - ovo je samo
- * dodatno obavestenje adminu da je do otkazivanja doslo.
- */
 async function notifyAdminOfUserCancellations() {
   const snapshot = await db
     .collection("appointments")
