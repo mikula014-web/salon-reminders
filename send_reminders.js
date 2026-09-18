@@ -220,12 +220,73 @@ async function notifyAdminOfUserCancellations() {
   }
 }
 
+/**
+ * Termini koji su ZAKAZANI ali čije je vreme već prošlo automatski se
+ * prebacuju u status ZAVRSEN (umesto da zauvek ostanu ZAKAZAN u bazi).
+ */
+async function finalizePastAppointments() {
+  const now = Date.now();
+  const snapshot = await db
+    .collection("appointments")
+    .where("status", "==", "ZAKAZAN")
+    .where("timestamp", "<", now)
+    .get();
+
+  console.log(`[zavrsavanje] Pronadjeno ${snapshot.size} proslih termina za oznacavanje kao ZAVRSEN.`);
+
+  for (const doc of snapshot.docs) {
+    try {
+      await doc.ref.update({ status: "ZAVRSEN" });
+      console.log(`[zavrsavanje] Termin ${doc.id} oznacen kao ZAVRSEN.`);
+    } catch (err) {
+      console.error(`[zavrsavanje] Greska za termin ${doc.id}:`, err.message);
+    }
+  }
+}
+
+/**
+ * SAMO OTKAZANI termini stariji od 24h se trajno brišu (zajedno sa
+ * eventualnim appointment_slots dokumentima). Završeni (ZAVRSEN) termini se
+ * NE brišu — ostaju kao poslovna evidencija salona (istorija posećenosti/
+ * prihoda). Ako želiš i njih da čistiš posle nekog vremena, javi mi period.
+ */
+async function cleanupOldCancelledAppointments() {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  const snapshot = await db
+    .collection("appointments")
+    .where("status", "==", "OTKAZAN")
+    .where("timestamp", "<", cutoff)
+    .get();
+
+  console.log(`[ciscenje] Pronadjeno ${snapshot.size} OTKAZANIH termina starijih od 24h za trajno brisanje.`);
+
+  for (const doc of snapshot.docs) {
+    try {
+      const slotsSnap = await db
+        .collection("appointment_slots")
+        .where("appointmentId", "==", doc.id)
+        .get();
+
+      const batch = db.batch();
+      slotsSnap.docs.forEach((slotDoc) => batch.delete(slotDoc.ref));
+      batch.delete(doc.ref);
+      await batch.commit();
+
+      console.log(`[ciscenje] Obrisan otkazan termin ${doc.id} i ${slotsSnap.size} pratecih slot dokumenata.`);
+    } catch (err) {
+      console.error(`[ciscenje] Greska brisanja termina ${doc.id}:`, err.message);
+    }
+  }
+}
+
 (async () => {
   try {
     await sendReminders();
     await sendAdminCancellationNotifications();
     await notifyAdminsOfNewBookings();
     await notifyAdminOfUserCancellations();
+    await finalizePastAppointments();
+    await cleanupOldCancelledAppointments();
     console.log("Gotovo.");
     process.exit(0);
   } catch (err) {
