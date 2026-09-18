@@ -53,6 +53,19 @@ function adminCancellationText(language, startTime, serviceName) {
   };
 }
 
+function reassignmentText(language, employeeName, startTime, serviceName) {
+  if (language === "EN") {
+    return {
+      title: "Stylist changed",
+      body: `Your appointment at ${startTime} (${serviceName}) has been reassigned to ${employeeName}.`,
+    };
+  }
+  return {
+    title: "Frizer promenjen",
+    body: `Vas termin za ${startTime} (${serviceName}) je dodeljen frizeru: ${employeeName}.`,
+  };
+}
+
 async function sendReminders() {
   const settingsDoc = await db.collection("settings").doc("salon").get();
   const hoursBefore =
@@ -115,9 +128,11 @@ async function sendAdminCancellationNotifications() {
     }
 
     const notification = adminCancellationText(language, appointment.startTime, appointment.serviceName);
-    await sendAndCleanupIfStale(fcmToken, appointment.userId, notification, "[otkazivanja]");
-    await doc.ref.update({ adminCancelNotified: true });
-    console.log(`[otkazivanja] Obradjeno obavestenje (${language}) za termin ${doc.id}`);
+    const sent = await sendAndCleanupIfStale(fcmToken, appointment.userId, notification, "[otkazivanja]");
+    if (sent) {
+      await doc.ref.update({ adminCancelNotified: true });
+      console.log(`[otkazivanja] Poslato obavestenje (${language}) za termin ${doc.id}`);
+    }
   }
 }
 
@@ -235,6 +250,44 @@ async function notifyAdminOfUserCancellations() {
  * Termini koji su ZAKAZANI ali čije je vreme već prošlo automatski se
  * prebacuju u status ZAVRSEN (umesto da zauvek ostanu ZAKAZAN u bazi).
  */
+/**
+ * NOVO: obaveštava korisnika kad admin promeni dodeljenog frizera na
+ * njegovom terminu (Admin panel -> Termini -> "Promeni frizera"). Android
+ * strana postavlja employeeReassignedNotified=false u istoj transakciji
+ * kojom menja frizera; ova funkcija to detektuje, šalje obaveštenje na
+ * korisnikovom jeziku, i vraća polje na true.
+ */
+async function notifyUserOfReassignment() {
+  const snapshot = await db
+    .collection("appointments")
+    .where("status", "==", "ZAKAZAN")
+    .where("employeeReassignedNotified", "==", false)
+    .get();
+
+  console.log(`[promena-frizera] Pronadjeno ${snapshot.size} termina sa promenjenim frizerom.`);
+  if (snapshot.empty) return;
+
+  for (const doc of snapshot.docs) {
+    const appointment = doc.data();
+
+    const userDoc = await db.collection("users").doc(appointment.userId).get();
+    const fcmToken = userDoc.exists ? userDoc.data().fcmToken : null;
+    const language = userDoc.exists ? (userDoc.data().language || "SR") : "SR";
+
+    if (!fcmToken) {
+      await doc.ref.update({ employeeReassignedNotified: true });
+      continue;
+    }
+
+    const notification = reassignmentText(language, appointment.employeeName, appointment.startTime, appointment.serviceName);
+    const sent = await sendAndCleanupIfStale(fcmToken, appointment.userId, notification, "[promena-frizera]");
+    if (sent) {
+      await doc.ref.update({ employeeReassignedNotified: true });
+      console.log(`[promena-frizera] Poslato obavestenje (${language}) za termin ${doc.id}`);
+    }
+  }
+}
+
 async function finalizePastAppointments() {
   const now = Date.now();
   const snapshot = await db
@@ -296,6 +349,7 @@ async function cleanupOldCancelledAppointments() {
     await sendAdminCancellationNotifications();
     await notifyAdminsOfNewBookings();
     await notifyAdminOfUserCancellations();
+    await notifyUserOfReassignment();
     await finalizePastAppointments();
     await cleanupOldCancelledAppointments();
     console.log("Gotovo.");
