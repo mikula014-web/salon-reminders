@@ -84,13 +84,10 @@ async function sendReminders() {
     }
 
     const notification = reminderText(language, appointment.startTime, appointment.serviceName);
-
-    try {
-      await admin.messaging().send({ token: fcmToken, notification });
+    const sent = await sendAndCleanupIfStale(fcmToken, appointment.userId, notification, "[podsetnici]");
+    if (sent) {
       await doc.ref.update({ notificationSent: true });
       console.log(`[podsetnici] Poslat podsetnik (${language}) za termin ${doc.id}`);
-    } catch (err) {
-      console.error(`[podsetnici] Greska slanja za termin ${doc.id}:`, err.message);
     }
   }
 }
@@ -118,14 +115,9 @@ async function sendAdminCancellationNotifications() {
     }
 
     const notification = adminCancellationText(language, appointment.startTime, appointment.serviceName);
-
-    try {
-      await admin.messaging().send({ token: fcmToken, notification });
-      await doc.ref.update({ adminCancelNotified: true });
-      console.log(`[otkazivanja] Poslato obavestenje (${language}) za termin ${doc.id}`);
-    } catch (err) {
-      console.error(`[otkazivanja] Greska slanja za termin ${doc.id}:`, err.message);
-    }
+    await sendAndCleanupIfStale(fcmToken, appointment.userId, notification, "[otkazivanja]");
+    await doc.ref.update({ adminCancelNotified: true });
+    console.log(`[otkazivanja] Obradjeno obavestenje (${language}) za termin ${doc.id}`);
   }
 }
 
@@ -138,10 +130,33 @@ async function getAdminTokens() {
     const usersSnap = await db.collection("users").where("telefon", "==", phone).get();
     usersSnap.forEach((doc) => {
       const token = doc.data().fcmToken;
-      if (token) adminTokens.push(token);
+      if (token) adminTokens.push({ token, userDocId: doc.id });
     });
   }
   return adminTokens;
+}
+
+/** Salje notifikaciju na dati token. Ako Firebase kaze da token vise nije
+ * registrovan (aplikacija deinstalirana / token istekao), automatski ga
+ * brise iz Firestore profila da se ne pokusava ponovo uzalud ubuduce. */
+async function sendAndCleanupIfStale(token, userDocId, notification, logTag) {
+  try {
+    await admin.messaging().send({ token, notification });
+    return true;
+  } catch (err) {
+    const staleCodes = ["messaging/registration-token-not-registered", "messaging/invalid-registration-token"];
+    if (staleCodes.includes(err.code) || (err.message && err.message.includes("NotRegistered"))) {
+      console.log(`${logTag} Token je zastareo, brisem ga iz profila korisnika ${userDocId}.`);
+      try {
+        await db.collection("users").doc(userDocId).update({ fcmToken: admin.firestore.FieldValue.delete() });
+      } catch (cleanupErr) {
+        console.error(`${logTag} Greska pri brisanju zastarelog tokena:`, cleanupErr.message);
+      }
+    } else {
+      console.error(`${logTag} Greska slanja:`, err.message);
+    }
+    return false;
+  }
 }
 
 // Admin obavestenja OSTAJU na srpskom (admin panel je samo na srpskom).
@@ -163,18 +178,16 @@ async function notifyAdminsOfNewBookings() {
   for (const doc of snapshot.docs) {
     const appointment = doc.data();
 
-    for (const token of adminTokens) {
-      try {
-        await admin.messaging().send({
-          token,
-          notification: {
-            title: "Novi termin zakazan",
-            body: `${appointment.userName} je zakazao/la: ${appointment.serviceName}, ${appointment.date} u ${appointment.startTime}.`,
-          },
-        });
-      } catch (err) {
-        console.error(`[admin-nov-termin] Greska slanja adminu za termin ${doc.id}:`, err.message);
-      }
+    for (const admin_ of adminTokens) {
+      await sendAndCleanupIfStale(
+        admin_.token,
+        admin_.userDocId,
+        {
+          title: "Novi termin zakazan",
+          body: `${appointment.userName} je zakazao/la: ${appointment.serviceName}, ${appointment.date} u ${appointment.startTime}.`,
+        },
+        "[admin-nov-termin]"
+      );
     }
 
     await doc.ref.update({ adminNotified: true });
@@ -201,18 +214,16 @@ async function notifyAdminOfUserCancellations() {
   for (const doc of snapshot.docs) {
     const appointment = doc.data();
 
-    for (const token of adminTokens) {
-      try {
-        await admin.messaging().send({
-          token,
-          notification: {
-            title: "Korisnik je otkazao termin",
-            body: `${appointment.userName} je otkazao/la: ${appointment.serviceName}, ${appointment.date} u ${appointment.startTime}. Termin je sada slobodan.`,
-          },
-        });
-      } catch (err) {
-        console.error(`[admin-otkazivanje] Greska slanja adminu za termin ${doc.id}:`, err.message);
-      }
+    for (const admin_ of adminTokens) {
+      await sendAndCleanupIfStale(
+        admin_.token,
+        admin_.userDocId,
+        {
+          title: "Korisnik je otkazao termin",
+          body: `${appointment.userName} je otkazao/la: ${appointment.serviceName}, ${appointment.date} u ${appointment.startTime}. Termin je sada slobodan.`,
+        },
+        "[admin-otkazivanje]"
+      );
     }
 
     await doc.ref.update({ userCancelAdminNotified: true });
