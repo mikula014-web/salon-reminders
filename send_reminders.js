@@ -27,42 +27,84 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-function reminderText(language, startTime, serviceName) {
+// ---------------------------------------------------------------------------
+// DATUMI U PORUKAMA: format dd.mm.yyyy (npr. 30.09.2026) + "danas"/"sutra".
+// "Danas" se racuna po vremenu u SRBIJI - GitHub server radi po UTC-u, pa
+// bi se oko ponoci inace pogresio dan.
+// ---------------------------------------------------------------------------
+const SALON_TZ = "Europe/Belgrade";
+
+// "2026-09-30" -> "30.09.2026"
+function formatDate(isoDate) {
+  const p = String(isoDate || "").split("-");
+  return p.length === 3 ? `${p[2]}.${p[1]}.${p[0]}` : String(isoDate || "");
+}
+
+// Datum (yyyy-mm-dd) u Srbiji: danas (0), sutra (1)...
+function salonDateIso(offsetDays = 0) {
+  const d = new Date(Date.now() + offsetDays * 24 * 60 * 60 * 1000);
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: SALON_TZ, year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(d);
+}
+
+// "danas, 30.09.2026" / "sutra, 01.10.2026" / "30.09.2026" (EN: today/tomorrow/on ...)
+function dayPhrase(isoDate, language) {
+  const date = formatDate(isoDate);
+  const en = language === "EN";
+  if (isoDate === salonDateIso(0)) return en ? `today, ${date}` : `danas, ${date}`;
+  if (isoDate === salonDateIso(1)) return en ? `tomorrow, ${date}` : `sutra, ${date}`;
+  return en ? `on ${date}` : date;
+}
+
+// Naziv usluge na jeziku korisnika (EN ako je unet prevod).
+function serviceNameFor(appointment, language) {
+  if (language === "EN" && appointment.serviceNameEn) return appointment.serviceNameEn;
+  return appointment.serviceName;
+}
+
+function reminderText(language, appointment) {
+  const when = dayPhrase(appointment.date, language);
+  const service = serviceNameFor(appointment, language);
   if (language === "EN") {
     return {
       title: "Appointment reminder",
-      body: `You have an appointment today at ${startTime}. Service: ${serviceName}.`,
+      body: `You have an appointment ${when} at ${appointment.startTime}. Service: ${service}.`,
     };
   }
   return {
     title: "Podsetnik za termin",
-    body: `Imate zakazan termin danas u ${startTime}. Usluga: ${serviceName}.`,
+    body: `Imate zakazan termin ${when} u ${appointment.startTime}. Usluga: ${service}.`,
   };
 }
 
-function adminCancellationText(language, startTime, serviceName) {
+function adminCancellationText(language, appointment) {
+  const when = dayPhrase(appointment.date, language);
+  const service = serviceNameFor(appointment, language);
   if (language === "EN") {
     return {
       title: "Appointment cancelled",
-      body: `Your appointment at ${startTime} (${serviceName}) has been cancelled by the salon.`,
+      body: `Your appointment ${when} at ${appointment.startTime} (${service}) has been cancelled by the salon.`,
     };
   }
   return {
     title: "Termin otkazan",
-    body: `Vas termin za ${startTime} (${serviceName}) je otkazan od strane salona.`,
+    body: `Vaš termin ${when} u ${appointment.startTime} (${service}) je otkazan od strane salona.`,
   };
 }
 
-function reassignmentText(language, employeeName, startTime, serviceName) {
+function reassignmentText(language, appointment) {
+  const when = dayPhrase(appointment.date, language);
+  const service = serviceNameFor(appointment, language);
   if (language === "EN") {
     return {
       title: "Stylist changed",
-      body: `Your appointment at ${startTime} (${serviceName}) has been reassigned to ${employeeName}.`,
+      body: `Your appointment ${when} at ${appointment.startTime} (${service}) has been reassigned to ${appointment.employeeName}.`,
     };
   }
   return {
     title: "Frizer promenjen",
-    body: `Vas termin za ${startTime} (${serviceName}) je dodeljen frizeru: ${employeeName}.`,
+    body: `Vaš termin ${when} u ${appointment.startTime} (${service}) je dodeljen frizeru: ${appointment.employeeName}.`,
   };
 }
 
@@ -96,7 +138,7 @@ async function sendReminders() {
       continue;
     }
 
-    const notification = reminderText(language, appointment.startTime, appointment.serviceName);
+    const notification = reminderText(language, appointment);
     const sent = await sendAndCleanupIfStale(fcmToken, appointment.userId, notification, "[podsetnici]");
     if (sent) {
       await doc.ref.update({ notificationSent: true });
@@ -127,7 +169,7 @@ async function sendAdminCancellationNotifications() {
       continue;
     }
 
-    const notification = adminCancellationText(language, appointment.startTime, appointment.serviceName);
+    const notification = adminCancellationText(language, appointment);
     const sent = await sendAndCleanupIfStale(fcmToken, appointment.userId, notification, "[otkazivanja]");
     if (sent) {
       await doc.ref.update({ adminCancelNotified: true });
@@ -199,7 +241,7 @@ async function notifyAdminsOfNewBookings() {
         admin_.userDocId,
         {
           title: "Novi termin zakazan",
-          body: `${appointment.userName} je zakazao/la: ${appointment.serviceName}, ${appointment.date} u ${appointment.startTime}.`,
+          body: `${appointment.userName} je zakazao/la: ${appointment.serviceName}, ${dayPhrase(appointment.date, "SR")} u ${appointment.startTime}.`,
         },
         "[admin-nov-termin]"
       );
@@ -235,7 +277,7 @@ async function notifyAdminOfUserCancellations() {
         admin_.userDocId,
         {
           title: "Korisnik je otkazao termin",
-          body: `${appointment.userName} je otkazao/la: ${appointment.serviceName}, ${appointment.date} u ${appointment.startTime}. Termin je sada slobodan.`,
+          body: `${appointment.userName} je otkazao/la: ${appointment.serviceName}, ${dayPhrase(appointment.date, "SR")} u ${appointment.startTime}. Termin je sada slobodan.`,
         },
         "[admin-otkazivanje]"
       );
@@ -279,7 +321,7 @@ async function notifyUserOfReassignment() {
       continue;
     }
 
-    const notification = reassignmentText(language, appointment.employeeName, appointment.startTime, appointment.serviceName);
+    const notification = reassignmentText(language, appointment);
     const sent = await sendAndCleanupIfStale(fcmToken, appointment.userId, notification, "[promena-frizera]");
     if (sent) {
       await doc.ref.update({ employeeReassignedNotified: true });
